@@ -1,6 +1,6 @@
 # director-shell-mcp
 
-`director-shell-mcp` is a small MCP server for director-mode agents. It uses the MCP stdio transport to provide a controlled escape hatch for running shell commands and supervising detached background jobs. Commands are started only when an agent explicitly calls a tool; the server does not run a shell on its own.
+`director-shell-mcp` is a small MCP server for director-mode agents. It uses the MCP stdio transport to provide a controlled escape hatch for writing files, running Python data-exploration code, running shell commands, and supervising detached background jobs. Commands are started only when an agent explicitly calls a tool; the server does not run a shell on its own.
 
 ## Install
 
@@ -64,6 +64,39 @@ Runs a command to completion. Parameters:
 
 The result contains `exit_code`, `duration_ms`, and `stdout`/`stderr` objects. Each stream includes up to approximately 50 KiB of preview text. If a stream exceeds that cap, its object also includes `truncated: true` and `full_output_path` pointing to a temporary file containing the complete stream. A timeout returns an MCP tool error with a clear message and the partial result.
 
+### `write_file`
+
+Writes UTF-8 text to an absolute file path. Parameters:
+
+- `path` (string, required): absolute file path.
+- `content` (string, required): text to write.
+- `append` (boolean, optional): append instead of replacing; defaults to `false`.
+- `create_dirs` (boolean, optional): create missing parent directories; defaults to `true`.
+
+The result contains `path`, `bytes_written`, `created` (whether the file did not exist before the call), and `appended`.
+
+### `edit_file`
+
+Replaces text in a UTF-8 file at an absolute path. Parameters:
+
+- `path` (string, required): absolute file path.
+- `old_text` (string, required): non-empty text to find.
+- `new_text` (string, required): replacement text.
+- `replace_all` (boolean, optional): replace every occurrence; defaults to `false`.
+
+Without `replace_all`, `old_text` must occur exactly once. Zero matches or multiple matches return an MCP tool error and leave the file unchanged. The result contains `path` and `replacements`.
+
+### `run_python`
+
+Runs Python source code to completion with bounded output and a timeout. On Windows, the server probes the `py` launcher first and then `python`, caching the first usable executable. Parameters:
+
+- `code` (string, required): Python source code.
+- `cwd` (string, optional): working directory for the Python process.
+- `timeout_ms` (integer, optional): defaults to 60,000; maximum 600,000.
+- `args` (array of strings, optional): values passed as `sys.argv[1:]`.
+
+The result contains `exit_code`, `duration_ms`, `stdout`/`stderr` objects, and `python_executable`. Output streams are capped and spilled to temporary files using the same behavior as `shell_run`. A timeout returns an MCP tool error with a clear message and the partial result.
+
 ### `job_start`
 
 Starts a detached command that continues after the tool call returns. Parameters:
@@ -100,4 +133,4 @@ Run the lightweight end-to-end smoke test (it uses only `echo` and PowerShell sl
 npm run smoke
 ```
 
-The smoke test starts a fresh MCP server over stdio, performs initialization, lists all five tools, exercises command completion and output capture, verifies a detached job while it is running and after it exits, checks persistence through `job_list`, and verifies a two-second timeout against a thirty-second sleep.
+The smoke test starts a fresh MCP server over stdio, performs initialization, lists all eight tools, exercises file writing, exact text editing, Python execution and argument passing, command completion and output capture, verifies a detached job while it is running and after it exits, checks persistence through `job_list`, and verifies a two-second timeout against a thirty-second sleep.

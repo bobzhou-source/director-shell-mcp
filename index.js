@@ -3,7 +3,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, createWriteStream, existsSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -20,6 +20,7 @@ const LOCAL_APP_DATA = process.env.LOCALAPPDATA || join(homedir(), "AppData", "L
 const JOBS_DIR = join(LOCAL_APP_DATA, "director-shell-mcp", "jobs");
 const TEMP_OUTPUT_DIR = join(tmpdir(), "director-shell-mcp");
 const SERVER_FILE = fileURLToPath(import.meta.url);
+let cachedPythonProbe;
 
 const TOOL_DEFINITIONS = [
   {
@@ -34,6 +35,51 @@ const TOOL_DEFINITIONS = [
         shell: { type: "string", enum: ["powershell", "cmd", "bash"], default: DEFAULT_SHELL },
       },
       required: ["command"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "write_file",
+    description: "Write UTF-8 text to an absolute file path, optionally appending and creating parent directories.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Absolute file path to write." },
+        content: { type: "string", description: "UTF-8 text to write." },
+        append: { type: "boolean", default: false, description: "Append instead of replacing the file." },
+        create_dirs: { type: "boolean", default: true, description: "Create missing parent directories before writing." },
+      },
+      required: ["path", "content"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "edit_file",
+    description: "Replace an exact text occurrence in a UTF-8 file at an absolute path.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Absolute file path to edit." },
+        old_text: { type: "string", description: "Non-empty text that must occur exactly once unless replace_all is true." },
+        new_text: { type: "string", description: "Replacement text." },
+        replace_all: { type: "boolean", default: false, description: "Replace every occurrence instead of requiring exactly one." },
+      },
+      required: ["path", "old_text", "new_text"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "run_python",
+    description: "Run Python code with optional arguments, bounded output, and a timeout.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        code: { type: "string", description: "Python source code to execute." },
+        cwd: { type: "string", description: "Working directory for the Python process." },
+        timeout_ms: { type: "integer", default: 60000, minimum: 1, maximum: MAX_TIMEOUT_MS },
+        args: { type: "array", items: { type: "string" }, description: "Arguments passed to Python as sys.argv[1:]." },
+      },
+      required: ["code"],
       additionalProperties: false,
     },
   },
@@ -169,6 +215,45 @@ function optionalCwd(args) {
   }
   return args.cwd;
 }
+function requireAbsolutePath(args) {
+  if (typeof args.path !== "string" || args.path.trim() === "") {
+    throw new Error("The path parameter is required and must be a non-empty absolute path.");
+  }
+  if (!isAbsolute(args.path)) {
+    throw new Error(`The path parameter must be an absolute path; received ${JSON.stringify(args.path)}.`);
+  }
+  return args.path;
+}
+
+function booleanValue(args, name, defaultValue) {
+  const value = args[name] === undefined ? defaultValue : args[name];
+  if (typeof value !== "boolean") throw new Error(`The ${name} parameter must be a boolean when provided.`);
+  return value;
+}
+
+function pythonExecutable() {
+  if (cachedPythonProbe) {
+    if (cachedPythonProbe.error) throw new Error(cachedPythonProbe.error);
+    return cachedPythonProbe.executable;
+  }
+  const candidates = IS_WINDOWS ? ["py", "python"] : ["python"];
+  for (const executable of candidates) {
+    let probe;
+    try {
+      probe = spawnSync(executable, ["--version"], { stdio: "ignore", windowsHide: true, timeout: 10_000 });
+    } catch {
+      continue;
+    }
+    if (!probe.error && probe.status === 0) {
+      cachedPythonProbe = { executable };
+      return executable;
+    }
+  }
+  const attempted = candidates.join(" and ");
+  const error = `No usable Python executable is available; tried ${attempted}.`;
+  cachedPythonProbe = { error };
+  throw new Error(error);
+}
 
 function timeoutValue(args) {
   const timeout = args.timeout_ms === undefined ? 60_000 : args.timeout_ms;
@@ -249,8 +334,7 @@ async function terminateProcess(child) {
   }
 }
 
-async function runCommand(command, cwd, shell, timeoutMs) {
-  const invocation = shellInvocation(shell, command);
+async function runProcess(invocation, cwd, timeoutMs) {
   const stdout = new OutputCapture("stdout");
   const stderr = new OutputCapture("stderr");
   const started = Date.now();
@@ -268,7 +352,7 @@ async function runCommand(command, cwd, shell, timeoutMs) {
   return new Promise((resolvePromise, rejectPromise) => {
     let timedOut = false;
     let spawnError = null;
-    let timer = setTimeout(() => {
+    const timer = setTimeout(() => {
       timedOut = true;
       void terminateProcess(child);
     }, timeoutMs);
@@ -300,6 +384,10 @@ async function runCommand(command, cwd, shell, timeoutMs) {
       }
     });
   });
+}
+
+async function runCommand(command, cwd, shell, timeoutMs) {
+  return runProcess(shellInvocation(shell, command), cwd, timeoutMs);
 }
 
 function jobPaths(jobId) {
@@ -454,6 +542,102 @@ async function handleShellRun(args) {
   }
   return jsonResult({ shell, ...result });
 }
+async function handleWriteFile(args) {
+  const filePath = requireAbsolutePath(args);
+  if (typeof args.content !== "string") {
+    throw new Error("The content parameter is required and must be a string.");
+  }
+  const append = booleanValue(args, "append", false);
+  const createDirs = booleanValue(args, "create_dirs", true);
+  const created = !existsSync(filePath);
+  try {
+    if (createDirs) await fs.mkdir(dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, args.content, { encoding: "utf8", flag: append ? "a" : "w" });
+  } catch (error) {
+    throw new Error(`Unable to write file ${filePath}: ${error.message}.`);
+  }
+  return jsonResult({
+    path: filePath,
+    bytes_written: Buffer.byteLength(args.content, "utf8"),
+    created,
+    appended: append,
+  });
+}
+
+async function handleEditFile(args) {
+  const filePath = requireAbsolutePath(args);
+  if (typeof args.old_text !== "string" || args.old_text.length === 0) {
+    throw new Error("The old_text parameter is required and must be a non-empty string.");
+  }
+  if (typeof args.new_text !== "string") {
+    throw new Error("The new_text parameter is required and must be a string.");
+  }
+  const replaceAll = booleanValue(args, "replace_all", false);
+  let original;
+  try {
+    original = await fs.readFile(filePath, "utf8");
+  } catch (error) {
+    throw new Error(`Unable to read file ${filePath}: ${error.message}.`);
+  }
+
+  let replacements = 0;
+  let offset = 0;
+  while ((offset = original.indexOf(args.old_text, offset)) !== -1) {
+    replacements += 1;
+    offset += args.old_text.length;
+  }
+  if (replacements === 0 || (!replaceAll && replacements !== 1)) {
+    throw new Error(`The old_text value occurs ${replacements} times in ${filePath}; expected exactly once unless replace_all is true.`);
+  }
+
+  const edited = replaceAll
+    ? original.split(args.old_text).join(args.new_text)
+    : original.replace(args.old_text, () => args.new_text);
+  try {
+    await fs.writeFile(filePath, edited, "utf8");
+  } catch (error) {
+    throw new Error(`Unable to write edited file ${filePath}: ${error.message}.`);
+  }
+  return jsonResult({ path: filePath, replacements });
+}
+
+async function handleRunPython(args) {
+  if (typeof args.code !== "string") {
+    throw new Error("The code parameter is required and must be a string.");
+  }
+  const cwd = optionalCwd(args);
+  await validateCwd(cwd);
+  const timeoutMs = timeoutValue(args);
+  if (args.args !== undefined && (!Array.isArray(args.args) || args.args.some((value) => typeof value !== "string"))) {
+    throw new Error("The args parameter must be an array of strings when provided.");
+  }
+  const python = pythonExecutable();
+  ensureDirectory(TEMP_OUTPUT_DIR);
+  const scriptPath = join(TEMP_OUTPUT_DIR, `${Date.now()}-${randomUUID()}-run-python.py`);
+  try {
+    try {
+      await fs.writeFile(scriptPath, args.code, "utf8");
+    } catch (error) {
+      throw new Error(`Unable to write the temporary Python script: ${error.message}.`);
+    }
+    const result = await runProcess({
+      executable: python,
+      args: [scriptPath, ...(args.args || [])],
+    }, cwd, timeoutMs);
+    if (result.timed_out) {
+      return jsonResult({
+        error: `Python command timed out after ${timeoutMs} ms.`,
+        timeout_ms: timeoutMs,
+        python_executable: python,
+        ...result,
+      }, true);
+    }
+    return jsonResult({ python_executable: python, ...result });
+  } finally {
+    await fs.rm(scriptPath, { force: true }).catch(() => {});
+  }
+}
+
 
 async function handleJobStart(args) {
   const command = requireCommand(args);
@@ -580,6 +764,9 @@ async function handleJobList() {
 async function handleTool(name, args) {
   switch (name) {
     case "shell_run": return handleShellRun(args);
+    case "write_file": return handleWriteFile(args);
+    case "edit_file": return handleEditFile(args);
+    case "run_python": return handleRunPython(args);
     case "job_start": return handleJobStart(args);
     case "job_status": return handleJobStatus(args);
     case "job_kill": return handleJobKill(args);
