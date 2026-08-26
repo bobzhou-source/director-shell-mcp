@@ -88,7 +88,7 @@ Without `replace_all`, `old_text` must occur exactly once. Zero matches or multi
 
 ### `run_python`
 
-Runs Python source code to completion with bounded output and a timeout. On Windows, the server probes the `py` launcher first and then `python`, caching the first usable executable. Parameters:
+Runs Python source code to completion with bounded output and a timeout. On Windows, the server probes the `py` launcher first and then `python`; on other systems it probes `python3` first and then `python`, caching the first usable executable. Parameters:
 
 - `code` (string, required): Python source code.
 - `cwd` (string, optional): working directory for the Python process.

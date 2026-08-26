@@ -236,7 +236,7 @@ function pythonExecutable() {
     if (cachedPythonProbe.error) throw new Error(cachedPythonProbe.error);
     return cachedPythonProbe.executable;
   }
-  const candidates = IS_WINDOWS ? ["py", "python"] : ["python"];
+  const candidates = IS_WINDOWS ? ["py", "python"] : ["python3", "python"];
   for (const executable of candidates) {
     let probe;
     try {
