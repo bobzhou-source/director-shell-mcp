@@ -3,7 +3,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, createWriteStream, existsSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -13,13 +13,20 @@ const SERVER_VERSION = "1.0.0";
 const OUTPUT_LIMIT = 50 * 1024;
 const MAX_TIMEOUT_MS = 600_000;
 const MAX_TAIL_LINES = 1_000;
+const MAX_GREP_RESULTS = 1_000;
+const MAX_GREP_CONTEXT = 5;
+const MAX_PROCESS_RESULTS = 1_000;
 const JOB_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const LOCK_NAME_PATTERN = /^[A-Za-z0-9_.-]{1,64}$/;
 const IS_WINDOWS = process.platform === "win32";
 const DEFAULT_SHELL = IS_WINDOWS ? "powershell" : "bash";
 const LOCAL_APP_DATA = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
 const JOBS_DIR = join(LOCAL_APP_DATA, "director-shell-mcp", "jobs");
+const LOCKS_DIR = join(LOCAL_APP_DATA, "director-shell-mcp", "locks");
 const TEMP_OUTPUT_DIR = join(tmpdir(), "director-shell-mcp");
 const SERVER_FILE = fileURLToPath(import.meta.url);
+const SKIPPED_SEARCH_DIRECTORIES = new Set(["node_modules", ".git", "bin", "obj", "dist", "target"]);
+const MAX_SEARCH_FILE_BYTES = 5 * 1024 * 1024;
 let cachedPythonProbe;
 
 const TOOL_DEFINITIONS = [
@@ -125,6 +132,99 @@ const TOOL_DEFINITIONS = [
     name: "job_list",
     description: "List all persisted jobs known to this server.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "grep_files",
+    description: "Recursively search text files with a JavaScript regular expression.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        pattern: { type: "string", description: "JavaScript regular expression source." },
+        path: { type: "string", description: "Absolute file or directory path to search." },
+        glob: { type: "string", description: "Optional simple filename filter using * and ? wildcards." },
+        case_sensitive: { type: "boolean", default: false },
+        max_results: { type: "integer", default: 200, minimum: 1, maximum: MAX_GREP_RESULTS },
+        context_lines: { type: "integer", default: 0, minimum: 0, maximum: MAX_GREP_CONTEXT },
+      },
+      required: ["pattern", "path"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "job_wait",
+    description: "Wait for a persisted job to exit, or return when the wait deadline expires.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        job_id: { type: "string", description: "Job id returned by job_start." },
+        timeout_ms: { type: "integer", default: 60000, minimum: 1, maximum: MAX_TIMEOUT_MS },
+        tail_lines: { type: "integer", default: 40, minimum: 0, maximum: MAX_TAIL_LINES },
+      },
+      required: ["job_id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "lock_acquire",
+    description: "Acquire a persisted cross-agent named mutex.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Mutex name using letters, digits, underscore, dot, or hyphen." },
+        wait_ms: { type: "integer", default: 0, minimum: 0, maximum: MAX_TIMEOUT_MS },
+        note: { type: "string", description: "Optional note describing the lock holder." },
+      },
+      required: ["name"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "lock_release",
+    description: "Release a persisted mutex using the token returned by lock_acquire.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Mutex name." },
+        token: { type: "string", description: "Token returned by lock_acquire." },
+      },
+      required: ["name", "token"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "screenshot",
+    description: "Capture the full screen or a visible window to a PNG file on Windows.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        target: { type: "string", enum: ["screen", "window"], default: "screen" },
+        window_title: { type: "string", description: "Case-insensitive title substring required for window capture." },
+        output_path: { type: "string", description: "Optional absolute .png output path." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "process_list",
+    description: "List visible system processes and available executable details on Windows.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name_filter: { type: "string", description: "Optional case-insensitive substring of process name or executable path." },
+        max_results: { type: "integer", default: 100, minimum: 1, maximum: MAX_PROCESS_RESULTS },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "file_lockers",
+    description: "List processes holding an existing file open on Windows.",
+    inputSchema: {
+      type: "object",
+      properties: { path: { type: "string", description: "Absolute path to an existing file." } },
+      required: ["path"],
+      additionalProperties: false,
+    },
   },
 ];
 
@@ -271,6 +371,108 @@ function tailValue(args) {
   return tail;
 }
 
+function boundedInteger(args, name, defaultValue, minimum, maximum) {
+  const value = args[name] === undefined ? defaultValue : args[name];
+  if (!Number.isInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} must be an integer between ${minimum} and ${maximum}.`);
+  }
+  return value;
+}
+
+function filenameGlobRegex(glob) {
+  if (glob === undefined) return null;
+  if (typeof glob !== "string" || glob.length === 0) {
+    throw new Error("The glob parameter must be a non-empty string when provided.");
+  }
+  let source = "^";
+  for (const character of glob) {
+    if (character === "*") source += ".*";
+    else if (character === "?") source += ".";
+    else source += character.replace(/[\\^$+?.()|[\]{}]/g, "\\$&");
+  }
+  return new RegExp(`${source}$`, "i");
+}
+
+async function searchFiles(rootPath, pattern, filenameFilter, caseSensitive, maxResults, contextLines) {
+  const matches = [];
+  let filesScanned = 0;
+  let truncated = false;
+  const visitedDirectories = new Set();
+
+  async function scanFile(filePath) {
+    if (filenameFilter && !filenameFilter.test(basename(filePath))) return;
+    let stats;
+    try {
+      stats = await fs.stat(filePath);
+    } catch {
+      return;
+    }
+    if (!stats.isFile()) return;
+    filesScanned += 1;
+    if (stats.size > MAX_SEARCH_FILE_BYTES) return;
+    let buffer;
+    try {
+      buffer = await fs.readFile(filePath);
+    } catch {
+      return;
+    }
+    if (buffer.subarray(0, Math.min(buffer.length, 8192)).includes(0)) return;
+    const lines = buffer.toString("utf8").split(/\r?\n/);
+    const expression = new RegExp(pattern, caseSensitive ? "" : "i");
+    for (let index = 0; index < lines.length; index += 1) {
+      if (!expression.test(lines[index])) continue;
+      matches.push({
+        file: filePath,
+        line_number: index + 1,
+        line: lines[index],
+        before: lines.slice(Math.max(0, index - contextLines), index),
+        after: lines.slice(index + 1, Math.min(lines.length, index + contextLines + 1)),
+      });
+      if (matches.length >= maxResults) {
+        truncated = true;
+        return;
+      }
+    }
+  }
+
+  async function scanDirectory(directoryPath) {
+    let realDirectory;
+    try {
+      realDirectory = await fs.realpath(directoryPath);
+    } catch {
+      return;
+    }
+    if (visitedDirectories.has(realDirectory)) return;
+    visitedDirectories.add(realDirectory);
+    let entries;
+    try {
+      entries = await fs.readdir(directoryPath, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      if (matches.length >= maxResults) return;
+      const childPath = join(directoryPath, entry.name);
+      if (entry.isDirectory()) {
+        if (!SKIPPED_SEARCH_DIRECTORIES.has(entry.name)) await scanDirectory(childPath);
+      } else if (entry.isFile() || entry.isSymbolicLink()) {
+        await scanFile(childPath);
+      }
+    }
+  }
+
+  let rootStats;
+  try {
+    rootStats = await fs.stat(rootPath);
+  } catch (error) {
+    throw new Error(`Unable to access search path ${rootPath}: ${error.message}.`);
+  }
+  if (rootStats.isDirectory()) await scanDirectory(rootPath);
+  else if (rootStats.isFile()) await scanFile(rootPath);
+  else throw new Error(`The search path is not a file or directory: ${rootPath}.`);
+  return { matches, files_scanned: filesScanned, truncated };
+}
 class OutputCapture {
   constructor(label) {
     this.label = label;
@@ -388,6 +590,213 @@ async function runProcess(invocation, cwd, timeoutMs) {
 
 async function runCommand(command, cwd, shell, timeoutMs) {
   return runProcess(shellInvocation(shell, command), cwd, timeoutMs);
+}
+function powerShellLiteral(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+async function runPowerShellJson(script, timeoutMs = 60_000) {
+  if (!IS_WINDOWS) throw new Error("This tool is only supported on Windows.");
+  ensureDirectory(TEMP_OUTPUT_DIR);
+  const scriptPath = join(TEMP_OUTPUT_DIR, `${Date.now()}-${randomUUID()}-helper.ps1`);
+  try {
+    await fs.writeFile(scriptPath, script, "utf8");
+    const result = await runProcess({
+      executable: "powershell.exe",
+      args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath],
+    }, undefined, timeoutMs);
+    if (result.timed_out) throw new Error(`PowerShell helper timed out after ${timeoutMs} ms.`);
+    let stdout = result.stdout?.text || "";
+    if (result.stdout?.full_output_path) stdout = await fs.readFile(result.stdout.full_output_path, "utf8");
+    if (result.exit_code !== 0) {
+      const stderr = (result.stderr?.text || "").trim().replace(/\s+/g, " ");
+      throw new Error(`PowerShell helper failed${stderr ? `: ${stderr}` : ` with exit code ${result.exit_code}`}.`);
+    }
+    try {
+      return JSON.parse(stdout.trim());
+    } catch (error) {
+      throw new Error(`PowerShell helper returned invalid JSON: ${error.message}.`);
+    }
+  } finally {
+    await fs.rm(scriptPath, { force: true }).catch(() => {});
+  }
+}
+
+function screenshotScript(target, outputPath, windowTitle) {
+  const output = powerShellLiteral(outputPath);
+  const title = powerShellLiteral(windowTitle || "");
+  return `
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$target = ${powerShellLiteral(target)}
+$outputPath = ${output}
+$windowTitle = ${title}
+$left = 0
+$top = 0
+$width = 0
+$height = 0
+$actualTitle = $null
+if ($target -eq 'screen') {
+  $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+  $left = $bounds.Left
+  $top = $bounds.Top
+  $width = $bounds.Width
+  $height = $bounds.Height
+} else {
+  Add-Type @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class DirectorWindowNative {
+  [StructLayout(LayoutKind.Sequential)]
+  public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+  [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hWnd, int attribute, out RECT rect, int size);
+}
+"@
+  $matched = $null
+  [DirectorWindowNative]::EnumWindows({
+    param($hWnd, $lParam)
+    if (-not [DirectorWindowNative]::IsWindowVisible($hWnd)) { return $true }
+    $text = New-Object System.Text.StringBuilder 1024
+    [void][DirectorWindowNative]::GetWindowText($hWnd, $text, $text.Capacity)
+    $candidate = $text.ToString()
+    if ($candidate.Length -gt 0 -and $candidate.IndexOf($windowTitle, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+      $matched = [pscustomobject]@{ Handle = $hWnd; Title = $candidate }
+      return $false
+    }
+    return $true
+  }, [IntPtr]::Zero)
+  if ($null -eq $matched) { throw "No visible window matched the title substring '$windowTitle'." }
+  $actualTitle = $matched.Title
+  $rect = New-Object DirectorWindowNative+RECT
+  $size = [Runtime.InteropServices.Marshal]::SizeOf($rect)
+  $dwmResult = [DirectorWindowNative]::DwmGetWindowAttribute($matched.Handle, 9, [ref]$rect, $size)
+  if ($dwmResult -ne 0) {
+    if (-not [DirectorWindowNative]::GetWindowRect($matched.Handle, [ref]$rect)) { throw "Unable to obtain the matched window bounds." }
+  }
+  $left = $rect.Left
+  $top = $rect.Top
+  $width = $rect.Right - $rect.Left
+  $height = $rect.Bottom - $rect.Top
+  if ($width -le 0 -or $height -le 0) { throw "The matched window has an empty capture rectangle." }
+}
+if ($width -le 0 -or $height -le 0) { throw "The screen has an empty capture rectangle." }
+$bitmap = $null
+$graphics = $null
+try {
+  $bitmap = [System.Drawing.Bitmap]::new($width, $height)
+  $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+  $graphics.CopyFromScreen($left, $top, 0, 0, [System.Drawing.Size]::new($width, $height))
+  $bitmap.Save($outputPath, [System.Drawing.Imaging.ImageFormat]::Png)
+} finally {
+  if ($null -ne $graphics) { $graphics.Dispose() }
+  if ($null -ne $bitmap) { $bitmap.Dispose() }
+}
+[pscustomobject]@{ path = $outputPath; width = $width; height = $height; target = $target; window_title = $actualTitle } | ConvertTo-Json -Compress
+`;
+}
+
+function processListScript(nameFilter, maxRows) {
+  return `
+$ErrorActionPreference = 'Stop'
+$nameFilter = ${powerShellLiteral(nameFilter || "")}
+$maxRows = ${maxRows}
+$items = @(Get-Process | ForEach-Object {
+  $name = $_.ProcessName
+  $path = $null
+  $started = $null
+  try { $path = $_.Path } catch {}
+  try { $started = $_.StartTime.ToUniversalTime().ToString('o') } catch {}
+  $candidate = "$name $path"
+  if ($nameFilter.Length -eq 0 -or $candidate.IndexOf($nameFilter, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+    [pscustomobject]@{
+      pid = [int]$_.Id
+      name = $name
+      path = $path
+      started_at = $started
+      working_set_bytes = [int64]$_.WorkingSet64
+    }
+  }
+} | Select-Object -First $maxRows)
+@($items) | ConvertTo-Json -Compress
+`;
+}
+
+function fileLockersScript(filePath) {
+  return `
+$ErrorActionPreference = 'Stop'
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class DirectorRestartManager {
+  [StructLayout(LayoutKind.Sequential)]
+  public struct RM_UNIQUE_PROCESS {
+    public int dwProcessId;
+    public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime;
+  }
+  public enum RM_APP_TYPE { RmUnknownApp = 0, RmMainWindow = 1, RmOtherWindow = 2, RmService = 3, RmExplorer = 4, RmConsole = 5, RmCritical = 1000 }
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  public struct RM_PROCESS_INFO {
+    public RM_UNIQUE_PROCESS Process;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string strAppName;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string strServiceShortName;
+    public RM_APP_TYPE ApplicationType;
+    public uint AppStatus;
+    public uint TSSessionId;
+    [MarshalAs(UnmanagedType.Bool)] public bool bRestartable;
+  }
+  [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+  public static extern int RmStartSession(out uint sessionHandle, int flags, string sessionKey);
+  [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+  public static extern int RmRegisterResources(uint sessionHandle, uint nFiles, string[] files, uint nApplications, RM_UNIQUE_PROCESS[] applications, uint nServices, string[] services);
+  [DllImport("rstrtmgr.dll")]
+  public static extern int RmGetList(uint sessionHandle, out uint needed, ref uint count, IntPtr processInfo, out uint rebootReasons);
+  [DllImport("rstrtmgr.dll")]
+  public static extern int RmGetList(uint sessionHandle, out uint needed, ref uint count, [In, Out] RM_PROCESS_INFO[] processInfo, out uint rebootReasons);
+  [DllImport("rstrtmgr.dll")]
+  public static extern int RmEndSession(uint sessionHandle);
+}
+"@
+$session = [uint32]0
+$started = $false
+try {
+  $result = [DirectorRestartManager]::RmStartSession([ref]$session, 0, [guid]::NewGuid().ToString())
+  if ($result -ne 0) { throw "RmStartSession failed with code $result." }
+  $started = $true
+  $files = [string[]]@(${powerShellLiteral(filePath)})
+  $result = [DirectorRestartManager]::RmRegisterResources($session, 1, $files, 0, $null, 0, $null)
+  if ($result -ne 0) { throw "RmRegisterResources failed with code $result." }
+  $needed = [uint32]0
+  $count = [uint32]0
+  $reasons = [uint32]0
+  $result = [DirectorRestartManager]::RmGetList($session, [ref]$needed, [ref]$count, [IntPtr]::Zero, [ref]$reasons)
+  if ($result -ne 0 -and $result -ne 234) { throw "RmGetList failed with code $result." }
+  $lockers = @()
+  if ($needed -gt 0) {
+    $infos = New-Object 'DirectorRestartManager+RM_PROCESS_INFO[]' $needed
+    $count = $needed
+    $result = [DirectorRestartManager]::RmGetList($session, [ref]$needed, [ref]$count, $infos, [ref]$reasons)
+    if ($result -ne 0) { throw "RmGetList failed with code $result." }
+    for ($index = 0; $index -lt $count; $index++) {
+      $lockers += [pscustomobject]@{
+        pid = [int]$infos[$index].Process.dwProcessId
+        app_name = $infos[$index].strAppName
+        app_type = $infos[$index].ApplicationType.ToString()
+      }
+    }
+  }
+  [pscustomobject]@{ path = ${powerShellLiteral(filePath)}; lockers = @($lockers) } | ConvertTo-Json -Compress
+} finally {
+  if ($started) { [void][DirectorRestartManager]::RmEndSession($session) }
+}
+`;
 }
 
 function jobPaths(jobId) {
@@ -761,6 +1170,222 @@ async function handleJobList() {
   return jsonResult({ jobs });
 }
 
+async function handleGrepFiles(args) {
+  if (typeof args.pattern !== "string") throw new Error("The pattern parameter is required and must be a string.");
+  const rootPath = requireAbsolutePath(args);
+  const caseSensitive = booleanValue(args, "case_sensitive", false);
+  const maxResults = boundedInteger(args, "max_results", 200, 1, MAX_GREP_RESULTS);
+  const contextLines = boundedInteger(args, "context_lines", 0, 0, MAX_GREP_CONTEXT);
+  let expression;
+  try {
+    expression = new RegExp(args.pattern, caseSensitive ? "" : "i");
+  } catch (error) {
+    throw new Error(`Invalid regular expression pattern: ${error.message}.`);
+  }
+  return jsonResult(await searchFiles(rootPath, expression.source, filenameGlobRegex(args.glob), caseSensitive, maxResults, contextLines));
+}
+
+async function jobStatusPayload(job, tailLines) {
+  const state = await jobState(job);
+  return {
+    job_id: job.job_id,
+    name: job.name,
+    pid: job.pid,
+    running: state.running,
+    exit_code: state.exitCode,
+    runtime_ms: state.runtimeMs,
+    started_at: job.started_at,
+    output_tail: await readTailLines(job.paths.combined, tailLines),
+  };
+}
+
+function sleep(milliseconds) {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
+}
+
+async function handleJobWait(args) {
+  if (args.job_id === undefined) throw new Error("The job_id parameter is required.");
+  const timeoutMs = timeoutValue(args);
+  const tailLines = tailValue(args);
+  const job = await loadJob(args.job_id);
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    const state = await jobState(job);
+    if (!state.running) return jsonResult({ ...(await jobStatusPayload(job, tailLines)), timed_out: false });
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return jsonResult({ ...(await jobStatusPayload(job, tailLines)), timed_out: true });
+    await sleep(Math.min(500, remaining));
+  }
+}
+
+function requireLockName(args) {
+  if (typeof args.name !== "string" || !LOCK_NAME_PATTERN.test(args.name)) {
+    throw new Error("The name parameter is required and must match ^[A-Za-z0-9_.-]{1,64}$.");
+  }
+  return args.name;
+}
+
+async function readLockOwner(lockDirectory) {
+  try {
+    return JSON.parse(await fs.readFile(join(lockDirectory, "owner.json"), "utf8"));
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw new Error(`Unable to read lock owner metadata: ${error.message}.`);
+  }
+}
+
+function processAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    return error.code !== "ESRCH" && error.code !== "EINVAL";
+  }
+  if (!IS_WINDOWS) return true;
+  const probe = spawnSync("tasklist.exe", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 5_000,
+  });
+  if (probe.error || probe.status !== 0) return true;
+  return new RegExp(`"[^"]+","${pid}"`).test(probe.stdout || "");
+}
+
+function lockHolderDescription(name, owner) {
+  if (!owner || !Number.isInteger(owner.pid)) return `Lock "${name}" is held by an unknown process.`;
+  const acquiredAtMs = Number.isFinite(owner.acquired_at_ms)
+    ? owner.acquired_at_ms
+    : Date.parse(owner.acquired_at || "") || Date.now();
+  const duration = Math.max(0, Date.now() - acquiredAtMs);
+  const note = typeof owner.note === "string" && owner.note.length > 0 ? `, note "${owner.note}"` : "";
+  return `Lock "${name}" is held by pid ${owner.pid}${note} for ${duration} ms.`;
+}
+
+async function handleLockAcquire(args) {
+  const name = requireLockName(args);
+  const waitMs = boundedInteger(args, "wait_ms", 0, 0, MAX_TIMEOUT_MS);
+  if (args.note !== undefined && typeof args.note !== "string") throw new Error("The note parameter must be a string when provided.");
+  const lockDirectory = join(LOCKS_DIR, name);
+  ensureDirectory(LOCKS_DIR);
+  const deadline = Date.now() + waitMs;
+  while (true) {
+    try {
+      await fs.mkdir(lockDirectory);
+      const token = randomUUID();
+      const acquiredAtMs = Date.now();
+      const owner = {
+        token,
+        pid: process.pid,
+        acquired_at: new Date(acquiredAtMs).toISOString(),
+        acquired_at_ms: acquiredAtMs,
+      };
+      if (args.note !== undefined) owner.note = args.note;
+      try {
+        await writeJsonAtomic(join(lockDirectory, "owner.json"), owner);
+      } catch (error) {
+        await fs.rm(lockDirectory, { recursive: true, force: true }).catch(() => {});
+        throw new Error(`Unable to write lock owner metadata: ${error.message}.`);
+      }
+      return jsonResult({ name, token, acquired_at: owner.acquired_at });
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+    }
+    const owner = await readLockOwner(lockDirectory);
+    if (owner && !processAlive(owner.pid)) {
+      await fs.rm(lockDirectory, { recursive: true, force: true }).catch(() => {});
+      continue;
+    }
+    const remaining = deadline - Date.now();
+    if (waitMs === 0 || remaining <= 0) throw new Error(lockHolderDescription(name, owner));
+    await sleep(Math.min(250, remaining));
+  }
+}
+
+async function handleLockRelease(args) {
+  const name = requireLockName(args);
+  if (typeof args.token !== "string" || args.token.length === 0) {
+    throw new Error("The token parameter is required and must be a non-empty string.");
+  }
+  const lockDirectory = join(LOCKS_DIR, name);
+  try {
+    const stats = await fs.stat(lockDirectory);
+    if (!stats.isDirectory()) throw new Error(`Lock "${name}" is not held.`);
+  } catch (error) {
+    if (error.code === "ENOENT") throw new Error(`Lock "${name}" is not held.`);
+    throw error;
+  }
+  const owner = await readLockOwner(lockDirectory);
+  if (!owner) throw new Error(`Lock "${name}" has no owner metadata; release was refused.`);
+  if (owner.token !== args.token) throw new Error(`Lock "${name}" token does not match the current holder; release was refused.`);
+  await fs.rm(lockDirectory, { recursive: true, force: true });
+  return jsonResult({ name, released: true });
+}
+
+async function handleScreenshot(args) {
+  const target = args.target === undefined ? "screen" : args.target;
+  if (target !== "screen" && target !== "window") throw new Error("The target parameter must be screen or window.");
+  let windowTitle;
+  if (target === "window") {
+    if (typeof args.window_title !== "string" || args.window_title.trim() === "") {
+      throw new Error("The window_title parameter is required when target is window.");
+    }
+    windowTitle = args.window_title;
+  }
+  const outputPath = args.output_path === undefined
+    ? join(TEMP_OUTPUT_DIR, `${Date.now()}-${randomUUID()}-screenshot.png`)
+    : args.output_path;
+  if (typeof outputPath !== "string" || !isAbsolute(outputPath)) {
+    throw new Error("The output_path parameter must be an absolute path when provided.");
+  }
+  if (!/\.png$/i.test(outputPath)) throw new Error("The output_path parameter must end with .png.");
+  if (!IS_WINDOWS) throw new Error("The screenshot tool is only supported on Windows.");
+  ensureDirectory(dirname(outputPath));
+  const result = await runPowerShellJson(screenshotScript(target, outputPath, windowTitle));
+  if (!result || result.path !== outputPath || !Number.isInteger(result.width) || !Number.isInteger(result.height)) {
+    throw new Error("The screenshot capture returned invalid dimensions.");
+  }
+  const value = { path: outputPath, width: result.width, height: result.height, target };
+  if (target === "window") value.window_title = result.window_title;
+  return jsonResult(value);
+}
+
+async function handleProcessList(args) {
+  if (args.name_filter !== undefined && typeof args.name_filter !== "string") {
+    throw new Error("The name_filter parameter must be a string when provided.");
+  }
+  const maxResults = boundedInteger(args, "max_results", 100, 1, MAX_PROCESS_RESULTS);
+  if (!IS_WINDOWS) throw new Error("The process_list tool is only supported on Windows.");
+  const raw = await runPowerShellJson(processListScript(args.name_filter, maxResults + 1));
+  const rows = Array.isArray(raw) ? raw : raw ? [raw] : [];
+  const truncated = rows.length > maxResults;
+  const processes = rows.slice(0, maxResults).map((row) => {
+    const value = { pid: row.pid, name: row.name };
+    if (typeof row.path === "string" && row.path.length > 0) value.path = row.path;
+    if (typeof row.started_at === "string" && row.started_at.length > 0) value.started_at = row.started_at;
+    if (Number.isFinite(row.working_set_bytes)) value.working_set_bytes = row.working_set_bytes;
+    return value;
+  });
+  return jsonResult({ processes, truncated });
+}
+
+async function handleFileLockers(args) {
+  const filePath = requireAbsolutePath(args);
+  let stats;
+  try {
+    stats = await fs.stat(filePath);
+  } catch (error) {
+    if (error.code === "ENOENT") throw new Error(`The file does not exist: ${filePath}.`);
+    throw new Error(`Unable to access file ${filePath}: ${error.message}.`);
+  }
+  if (!stats.isFile()) throw new Error(`The path is not an existing file: ${filePath}.`);
+  if (!IS_WINDOWS) throw new Error("The file_lockers tool is only supported on Windows.");
+  const result = await runPowerShellJson(fileLockersScript(filePath));
+  const lockers = Array.isArray(result?.lockers) ? result.lockers : result?.lockers ? [result.lockers] : [];
+  return jsonResult({
+    path: filePath,
+    lockers: lockers.map((locker) => ({ pid: locker.pid, app_name: locker.app_name, app_type: locker.app_type })),
+  });
+}
 async function handleTool(name, args) {
   switch (name) {
     case "shell_run": return handleShellRun(args);
@@ -769,8 +1394,15 @@ async function handleTool(name, args) {
     case "run_python": return handleRunPython(args);
     case "job_start": return handleJobStart(args);
     case "job_status": return handleJobStatus(args);
+    case "job_wait": return handleJobWait(args);
     case "job_kill": return handleJobKill(args);
     case "job_list": return handleJobList();
+    case "grep_files": return handleGrepFiles(args);
+    case "lock_acquire": return handleLockAcquire(args);
+    case "lock_release": return handleLockRelease(args);
+    case "screenshot": return handleScreenshot(args);
+    case "process_list": return handleProcessList(args);
+    case "file_lockers": return handleFileLockers(args);
     default: throw new Error(`Unknown tool ${JSON.stringify(name)}.`);
   }
 }

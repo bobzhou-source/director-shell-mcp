@@ -1,7 +1,8 @@
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { promises as fs } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
@@ -27,12 +28,39 @@ function payload(result) {
   return JSON.parse(text);
 }
 
+function waitForChild(child) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    child.once("error", rejectPromise);
+    child.once("close", (code) => resolvePromise(code));
+  });
+}
+
 try {
   await client.connect(transport);
   const listed = await client.listTools();
   const toolNames = listed.tools.map((tool) => tool.name).sort();
   check("initialize handshake", true);
-  check("lists eight director tools", JSON.stringify(toolNames) === JSON.stringify(["edit_file", "job_kill", "job_list", "job_start", "job_status", "run_python", "shell_run", "write_file"]), toolNames.join(", "));
+  check("lists fifteen director tools", JSON.stringify(toolNames) === JSON.stringify(["edit_file", "file_lockers", "grep_files", "job_kill", "job_list", "job_start", "job_status", "job_wait", "lock_acquire", "lock_release", "process_list", "run_python", "screenshot", "shell_run", "write_file"]), toolNames.join(", "));
+
+  const readmePath = join(projectDir, "README.md");
+  const grepKnownResult = await client.callTool({
+    name: "grep_files",
+    arguments: { pattern: "director-shell-mcp", path: readmePath, case_sensitive: true },
+  });
+  const grepKnown = payload(grepKnownResult);
+  check("grep_files finds README string", grepKnownResult.isError !== true && grepKnown.matches?.[0]?.file === readmePath && grepKnown.matches?.[0]?.line_number === 1);
+  const grepInvalidResult = await client.callTool({
+    name: "grep_files",
+    arguments: { pattern: "[", path: readmePath },
+  });
+  const grepInvalid = payload(grepInvalidResult);
+  check("grep_files invalid regex is an MCP error", grepInvalidResult.isError === true && /invalid regular expression/i.test(grepInvalid.error || ""));
+  const grepLimitedResult = await client.callTool({
+    name: "grep_files",
+    arguments: { pattern: "the", path: readmePath, max_results: 1 },
+  });
+  const grepLimited = payload(grepLimitedResult);
+  check("grep_files max_results truncates", grepLimitedResult.isError !== true && grepLimited.matches?.length === 1 && grepLimited.truncated === true);
 
   const echoResult = await client.callTool({ name: "shell_run", arguments: { command: "echo hello" } });
   const echo = payload(echoResult);
@@ -107,6 +135,113 @@ try {
   const jobsResult = await client.callTool({ name: "job_list", arguments: {} });
   const jobs = payload(jobsResult);
   check("job_list includes completed job", jobs.jobs?.some((job) => job.job_id === started.job_id && job.running === false && job.exit_code === 0));
+
+  const waitStartResult = await client.callTool({
+    name: "job_start",
+    arguments: { command: "Start-Sleep -Seconds 2", name: "smoke-wait" },
+  });
+  const waitStarted = payload(waitStartResult);
+  const waited = payload(await client.callTool({
+    name: "job_wait",
+    arguments: { job_id: waitStarted.job_id, timeout_ms: 10_000, tail_lines: 40 },
+  }));
+  check("job_wait observes completed job", waited.running === false && waited.exit_code === 0 && waited.timed_out === false);
+
+  const shortWaitStartResult = await client.callTool({
+    name: "job_start",
+    arguments: { command: "Start-Sleep -Seconds 4", name: "smoke-wait-timeout" },
+  });
+  const shortWaitStarted = payload(shortWaitStartResult);
+  const shortWait = payload(await client.callTool({
+    name: "job_wait",
+    arguments: { job_id: shortWaitStarted.job_id, timeout_ms: 250 },
+  }));
+  check("job_wait reports a normal deadline timeout", shortWait.running === true && shortWait.timed_out === true);
+  const finishedShortWait = payload(await client.callTool({
+    name: "job_wait",
+    arguments: { job_id: shortWaitStarted.job_id, timeout_ms: 10_000 },
+  }));
+  check("job_wait can be called again after timeout", finishedShortWait.running === false && finishedShortWait.exit_code === 0 && finishedShortWait.timed_out === false);
+
+  const lockName = `smoke-lock-${Date.now()}`;
+  const lockFirstResult = await client.callTool({
+    name: "lock_acquire",
+    arguments: { name: lockName, note: "smoke holder" },
+  });
+  const lockFirst = payload(lockFirstResult);
+  check("lock_acquire succeeds", lockFirstResult.isError !== true && lockFirst.name === lockName && typeof lockFirst.token === "string");
+  const lockSecondResult = await client.callTool({ name: "lock_acquire", arguments: { name: lockName, wait_ms: 0 } });
+  const lockSecond = payload(lockSecondResult);
+  check("second lock_acquire names current holder", lockSecondResult.isError === true && /pid \d+.*smoke holder/i.test(lockSecond.error || ""));
+  const wrongReleaseResult = await client.callTool({ name: "lock_release", arguments: { name: lockName, token: "wrong-token" } });
+  const wrongRelease = payload(wrongReleaseResult);
+  check("lock_release rejects a wrong token", wrongReleaseResult.isError === true && /does not match|refused/i.test(wrongRelease.error || ""));
+  const releaseResult = await client.callTool({ name: "lock_release", arguments: { name: lockName, token: lockFirst.token } });
+  check("lock_release accepts the owner token", releaseResult.isError !== true && payload(releaseResult).released === true);
+  const lockAgainResult = await client.callTool({ name: "lock_acquire", arguments: { name: lockName } });
+  const lockAgain = payload(lockAgainResult);
+  check("released lock can be acquired again", lockAgainResult.isError !== true && typeof lockAgain.token === "string");
+  await client.callTool({ name: "lock_release", arguments: { name: lockName, token: lockAgain.token } });
+
+  const exitedChild = spawn(process.execPath, ["-e", ""], { stdio: "ignore", windowsHide: true });
+  const exitedPid = exitedChild.pid;
+  const lockRoot = join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "director-shell-mcp", "locks");
+  const staleName = `smoke-stale-${Date.now()}`;
+  const staleDirectory = join(lockRoot, staleName);
+  await fs.mkdir(staleDirectory, { recursive: true });
+  await fs.writeFile(join(staleDirectory, "owner.json"), JSON.stringify({
+    token: "stale-token",
+    pid: exitedPid,
+    acquired_at: new Date(Date.now() - 60_000).toISOString(),
+  }), "utf8");
+  const staleResult = await client.callTool({ name: "lock_acquire", arguments: { name: staleName, wait_ms: 0 } });
+  const stale = payload(staleResult);
+  check("lock_acquire recovers a stale owner", staleResult.isError !== true && stale.name === staleName && typeof stale.token === "string");
+  if (stale.token) await client.callTool({ name: "lock_release", arguments: { name: staleName, token: stale.token } });
+
+  const screenshotResult = await client.callTool({ name: "screenshot", arguments: { target: "screen" } });
+  const screenshot = payload(screenshotResult);
+  if (screenshotResult.isError === true) {
+    check("screenshot reports a clear unavailable-capture error", /supported|capture|screen/i.test(screenshot.error || ""));
+  } else {
+    const screenshotBytes = await fs.readFile(screenshot.path);
+    check("screenshot writes PNG magic bytes", screenshotBytes[0] === 0x89 && screenshotBytes[1] === 0x50 && screenshotBytes[2] === 0x4e && screenshotBytes[3] === 0x47);
+    check("screenshot reports nonzero dimensions", screenshot.width > 0 && screenshot.height > 0);
+  }
+
+  const processListResult = await client.callTool({ name: "process_list", arguments: { name_filter: "node" } });
+  const processList = payload(processListResult);
+  check("process_list finds the smoke process tree", processListResult.isError !== true && processList.processes?.some((entry) => entry.pid === globalThis.process.pid));
+
+  const lockerFilePath = join(smokeTempDir, "locker-target.txt");
+  await fs.writeFile(lockerFilePath, "locker test\n", "utf8");
+  const unlockedResult = await client.callTool({ name: "file_lockers", arguments: { path: lockerFilePath } });
+  const unlocked = payload(unlockedResult);
+  check("file_lockers reports an unlocked file", unlockedResult.isError !== true && Array.isArray(unlocked.lockers) && unlocked.lockers.length === 0);
+  const escapedLockerPath = lockerFilePath.replace(/'/g, "''");
+  const lockerJobResult = await client.callTool({
+    name: "job_start",
+    arguments: {
+      shell: "powershell",
+      command: `$f=[System.IO.File]::Open('${escapedLockerPath}',[System.IO.FileMode]::Open,[System.IO.FileAccess]::ReadWrite,[System.IO.FileShare]::None); try { Start-Sleep -Seconds 8 } finally { $f.Dispose() }`,
+      name: "smoke-file-locker",
+    },
+  });
+  const lockerJob = payload(lockerJobResult);
+  let foundLocker = false;
+  const lockerDeadline = Date.now() + 6_000;
+  while (Date.now() < lockerDeadline) {
+    const lockerResult = await client.callTool({ name: "file_lockers", arguments: { path: lockerFilePath } });
+    const lockers = payload(lockerResult);
+    if (lockerResult.isError !== true && lockers.lockers?.length > 0) {
+      foundLocker = true;
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  check("file_lockers reports an active locker", foundLocker);
+  const lockerFinished = payload(await client.callTool({ name: "job_wait", arguments: { job_id: lockerJob.job_id, timeout_ms: 15_000 } }));
+  check("file-locking job exits cleanly", lockerFinished.running === false && lockerFinished.exit_code === 0);
 
   const timeoutResult = await client.callTool({
     name: "shell_run",

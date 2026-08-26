@@ -125,6 +125,56 @@ Terminates a job started by this server. It accepts `job_id`. On Windows it uses
 
 Lists all valid persisted jobs with their `job_id`, optional `name`, `pid`, `running` state, exit code, and start time.
 
+### `grep_files`
+
+Searches an absolute file or directory recursively using a JavaScript regular expression without requiring ripgrep. The search skips `node_modules`, `.git`, `bin`, `obj`, `dist`, and `target`, ignores files larger than 5 MiB and binary files, and stops at the result limit. Parameters:
+
+- `pattern` (string, required): JavaScript regular expression source.
+- `path` (string, required): absolute file or directory path.
+- `glob` (string, optional): simple filename filter using `*` and `?`.
+- `case_sensitive` (boolean, optional): defaults to `false`.
+- `max_results` (integer, optional): defaults to 200; maximum 1,000.
+- `context_lines` (integer, optional): lines before and after each match; defaults to 0; maximum 5.
+
+The result contains `matches` with `file`, `line_number`, `line`, `before`, and `after`, plus `files_scanned` and `truncated`. Invalid regular expressions return an MCP tool error.
+
+### `job_wait`
+
+Waits for an existing detached job to exit, polling its persisted exit marker every 500 ms. Parameters:
+
+- `job_id` (string, required): id returned by `job_start`.
+- `timeout_ms` (integer, optional): defaults to 60,000; maximum 600,000.
+- `tail_lines` (integer, optional): defaults to 40; maximum 1,000.
+
+The result has the same fields as `job_status` and adds `timed_out`. A deadline while the job is still running is a normal result with `timed_out: true`, not an MCP error.
+
+### `lock_acquire` and `lock_release`
+
+Provide a cross-agent named mutex persisted beneath `%LOCALAPPDATA%/director-shell-mcp/locks/`. Names contain only letters, digits, `_`, `.`, and `-` and are at most 64 characters. `lock_acquire` accepts `name` (required), `wait_ms` (optional, defaults to 0, maximum 600,000), and an optional `note`; it returns `name`, a UUID `token`, and `acquired_at`. Acquisition uses an atomic directory create and recovers locks whose recorded owner process is no longer alive. A held lock error identifies its pid, note when present, and duration. `lock_release` accepts `name` and the owner `token`; wrong tokens and free locks are errors and do not change the lock.
+
+### `screenshot`
+
+Captures the full virtual screen, or a visible top-level window, to a PNG on Windows using System.Drawing and the Windows APIs. Parameters:
+
+- `target` (`screen` or `window`, optional): defaults to `screen`.
+- `window_title` (string, required for `window`): case-insensitive visible-window title substring.
+- `output_path` (absolute `.png`, optional): defaults to a timestamped file in the temporary output directory.
+
+The result contains `path`, `width`, `height`, `target`, and the matched `window_title` for window captures. It returns a clear not-supported error on non-Windows systems and a clear no-match error when a requested window cannot be found.
+
+### `process_list`
+
+Returns a read-only process listing on Windows. Parameters:
+
+- `name_filter` (string, optional): case-insensitive substring of a process name or executable path.
+- `max_results` (integer, optional): defaults to 100; maximum 1,000.
+
+Each process contains `pid` and `name`, and includes `path`, `started_at`, and `working_set_bytes` when available. The result also contains `truncated`.
+
+### `file_lockers`
+
+Reports processes holding an existing file open on Windows via the Restart Manager API. It accepts `path` (required), which must be an absolute path to an existing file, and returns `{ path, lockers }`. Each locker contains `pid`, `app_name`, and `app_type`; an unlocked file is a successful result with an empty `lockers` array. Non-Windows systems return a clear not-supported error.
+
 ## Verification
 
 Run the lightweight end-to-end smoke test (it uses only `echo` and PowerShell sleep):
@@ -133,4 +183,4 @@ Run the lightweight end-to-end smoke test (it uses only `echo` and PowerShell sl
 npm run smoke
 ```
 
-The smoke test starts a fresh MCP server over stdio, performs initialization, lists all eight tools, exercises file writing, exact text editing, Python execution and argument passing, command completion and output capture, verifies a detached job while it is running and after it exits, checks persistence through `job_list`, and verifies a two-second timeout against a thirty-second sleep.
+The smoke test starts a fresh MCP server over stdio, performs initialization, lists all fifteen tools, exercises file writing, exact text editing, Python execution and argument passing, command completion and output capture, verifies detached jobs while they are running and after they exit, exercises grep, wait, locks, screenshots, process listing, and Restart Manager file-locker detection, checks persistence through `job_list`, and verifies command timeout handling.
