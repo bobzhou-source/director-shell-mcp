@@ -1,0 +1,17 @@
+{
+  "name": "director-shell-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "An MCP stdio server that gives director-mode agents shell and background-job capabilities.",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "smoke": "node smoke.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.5"
+  }
+}
