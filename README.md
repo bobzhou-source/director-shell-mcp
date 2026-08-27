@@ -13,7 +13,7 @@ npm install
 Run the server directly with:
 
 ```powershell
-node C:/Users/RZHOU/Desktop/director-shell-mcp/index.js
+node C:/path/to/director-shell-mcp/index.js
 ```
 
 ## OMP registration (primary)
@@ -26,7 +26,7 @@ The primary client is the Oh My Pi (OMP) harness. Add this exact configuration t
   "mcpServers": {
     "director-shell": {
       "command": "node",
-      "args": ["C:/Users/RZHOU/Desktop/director-shell-mcp/index.js"]
+      "args": ["C:/path/to/director-shell-mcp/index.js"]
     }
   }
 }
@@ -43,7 +43,7 @@ Other MCP clients generally accept an equivalent stdio registration:
   "mcpServers": {
     "director-shell": {
       "command": "node",
-      "args": ["C:/Users/RZHOU/Desktop/director-shell-mcp/index.js"]
+      "args": ["C:/path/to/director-shell-mcp/index.js"]
     }
   }
 }
@@ -184,3 +184,7 @@ npm run smoke
 ```
 
 The smoke test starts a fresh MCP server over stdio, performs initialization, lists all fifteen tools, exercises file writing, exact text editing, Python execution and argument passing, command completion and output capture, verifies detached jobs while they are running and after they exit, exercises grep, wait, locks, screenshots, process listing, and Restart Manager file-locker detection, checks persistence through `job_list`, and verifies command timeout handling.
+
+## License
+
+MIT

@@ -2,7 +2,14 @@
   "name": "director-shell-mcp",
   "version": "1.0.0",
   "private": true,
-  "description": "An MCP stdio server that gives director-mode agents shell and background-job capabilities.",
+  "description": "MCP server giving director-mode AI agents shell, file, Python, job, lock, and screenshot tools",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "shell",
+    "agent"
+  ],
   "type": "module",
   "main": "index.js",
   "scripts": {
