@@ -4,6 +4,7 @@
   "private": true,
   "description": "MCP server giving director-mode AI agents shell, file, Python, job, lock, and screenshot tools",
   "license": "MIT",
+  "repository": "https://github.com/bobzhou-source/director-shell-mcp",
   "keywords": [
     "mcp",
     "model-context-protocol",
