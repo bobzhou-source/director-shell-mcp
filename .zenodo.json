@@ -1,0 +1,46 @@
+{
+  "title": "director-shell-mcp: Model Context Protocol (MCP) Server Giving Director-Mode AI Agents Shell, File-Edit, Python, Background-Job, Lock and Screenshot Tools — Robert Zhou",
+  "description": "<p>MCP stdio server that gives director-mode AI coding agents a controlled escape hatch: shell commands, file writes and exact-match edits, Python data exploration, detached background jobs, cross-agent locks, grep, process listing and screenshots.</p><p>It is the open-source 15-tool server behind Robert Zhou's multi-agent Roblox Studio game pipeline (shared game spine, 3D asset pipeline, geometry and visual audits), registered in the Oh My Pi (OMP) agent harness and any MCP-compatible client such as Claude Code or Codex. Node.js 18+, MIT licensed.</p><p>Author: Robert Zhou, Colby College. Portfolio: <a href=\"https://robertzhou.dev\">robertzhou.dev</a>. Project write-up: <a href=\"https://robertzhou.dev/work/roblox-ai-pipeline/\">https://robertzhou.dev/work/roblox-ai-pipeline/</a>. Source: <a href=\"https://github.com/bobzhou-source/director-shell-mcp\">github.com/bobzhou-source/director-shell-mcp</a>.</p>",
+  "upload_type": "software",
+  "creators": [
+    {
+      "name": "Zhou, Robert",
+      "affiliation": "Colby College",
+      "orcid": "0009-0009-2155-7215"
+    }
+  ],
+  "keywords": [
+    "Model Context Protocol",
+    "MCP server",
+    "AI agents",
+    "multi-agent orchestration",
+    "director-mode agents",
+    "agentic coding",
+    "shell automation",
+    "Node.js",
+    "Roblox Studio",
+    "background jobs",
+    "Oh My Pi",
+    "Claude Code",
+    "LLM tooling",
+    "Robert Zhou"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://robertzhou.dev",
+      "relation": "isSupplementedBy",
+      "scheme": "url"
+    },
+    {
+      "identifier": "https://robertzhou.dev/work/roblox-ai-pipeline/",
+      "relation": "isDocumentedBy",
+      "scheme": "url"
+    },
+    {
+      "identifier": "https://github.com/bobzhou-source/director-shell-mcp",
+      "relation": "isSupplementTo",
+      "scheme": "url"
+    }
+  ],
+  "license": "MIT"
+}
