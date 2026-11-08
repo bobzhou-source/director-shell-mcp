@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+type: software
+title: "director-shell-mcp: Model Context Protocol (MCP) Server Giving Director-Mode AI Agents Shell, File-Edit, Python, Background-Job, Lock and Screenshot Tools"
+abstract: "MCP stdio server that gives director-mode AI coding agents a controlled escape hatch: shell commands, file writes and exact-match edits, Python data exploration, detached background jobs, cross-agent locks, grep, process listing and screenshots."
+authors:
+  - family-names: Zhou
+    given-names: Robert
+    orcid: https://orcid.org/0009-0009-2155-7215
+    affiliation: Colby College
+    website: https://robertzhou.dev
+url: https://robertzhou.dev
+repository-code: https://github.com/bobzhou-source/director-shell-mcp
+license: MIT
+keywords:
+  - "Model Context Protocol"
+  - "MCP server"
+  - "AI agents"
+  - "multi-agent orchestration"
+  - "director-mode agents"
+  - "agentic coding"
+  - "shell automation"
+  - "Node.js"
+  - "Roblox Studio"
+  - "background jobs"
+  - "Oh My Pi"
+  - "Claude Code"
+  - "LLM tooling"
+  - "Robert Zhou"
